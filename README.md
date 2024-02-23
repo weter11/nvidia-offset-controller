@@ -1,5 +1,5 @@
 # nvidia-offset-controller
-control Nvidia GPUs frequency offsets
+Small script to control Nvidia GPUs frequency offsets
 
 Basic offset controller with advanced settings.
 

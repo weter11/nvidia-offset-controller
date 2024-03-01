@@ -5,7 +5,7 @@ Basic offset controller with advanced settings.
 
 Settings explanation: 
 
-nvidia_smi_lgc_min & nvidia_smi_lgc_max -set range GPU frequencies should work (RTX 30xx desktop & mobile(Ampere arch) & up only)
+nvidia_smi_lgc_min & nvidia_smi_lgc_max -set range GPU frequencies should work (RTX 30xx desktop & mobile (Ampere arch) & up only)
 
 frequency_min & frequency_max - set frequencies range for offset calculations
 

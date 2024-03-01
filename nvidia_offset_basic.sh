@@ -19,9 +19,14 @@ fi
 
 # Calculate freq_offset linearly from frequency_min to frequency_max and round to nearest multiple of 5
 calculate_freq_offset() {
-    local freq=$1
-    local freq_offset=$((freq_offset_max - ((freq_offset_max - freq_offset_min) * (freq - frequency_min)) / (frequency_max - frequency_min)))
-    local rounded_offset=$(( (freq_offset + 2) / 5 * 5 ))  # Round to nearest multiple of 5
+     freq=$1
+     if [ $freq -lt $frequency_min ]; then
+        freq_offset=$freq_offset_max
+    elif [ $freq -gt $frequency_max ]; then
+        freq_offset=$freq_offset_min
+    else freq_offset=$((freq_offset_max - ((freq - frequency_min) * (freq_offset_max - freq_offset_min) / (frequency_max - frequency_min))))
+    fi
+     rounded_offset=$(( (freq_offset + 2) / 5 * 5 ))  # Round to nearest multiple of 5
     echo $rounded_offset
 }
 

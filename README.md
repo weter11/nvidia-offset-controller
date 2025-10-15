@@ -1,5 +1,7 @@
 # nvidia-offset-controller
-Small script to control Nvidia GPUs frequency offsets
+Small scripts to control Nvidia GPUs frequency offsets
+
+Second edition now uses python and working only on drivers 555+
 
 Basic offset controller with advanced settings.
 

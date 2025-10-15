@@ -1,0 +1,623 @@
+#!/usr/bin/env python3
+"""
+GPU Offset Control Script using NVML
+Requires: nvidia-ml-py, sudo privileges
+"""
+
+import sys
+import time
+import argparse
+from pynvml import *
+import ctypes
+
+# ===== USER CONFIGURABLE PARAMETERS =====
+CONFIG = {
+    # Clock frequency limits (MHz)
+    'min_clock': 210,
+    'max_clock': 1800,
+    
+    # Temperature thresholds (°C)
+    'temperature_min': 20,
+    'temperature_max': 80,
+    
+    # Power limits (watts) - for monitoring only
+    'plimit_min': 20,
+    'plimit_max': 120,
+    
+    # Frequency thresholds for offset calculation (MHz)
+    'frequency_min': 900,
+    'frequency_max': 1800,
+    
+    # Base frequency offset range (MHz)
+    'freq_offset_max': 300,
+    'freq_offset_min': 150,
+    
+    # Low frequency range settings
+    'low_freq_min': 1000,
+    'low_freq_max': 1450,
+    'drain_offset_lmin': -30,
+    'drain_offset_lmax': 0,
+    
+    # High frequency range settings
+    'high_freq_min': 1450,
+    'high_freq_max': 1800,
+    'drain_offset_hmin': 0,
+    'drain_offset_hmax': 15,
+    
+    # Critical temperature range
+    'critical_temp_min': 48,
+    'critical_temp_max': 61,
+    
+    # Power-based offset range (MHz)
+    'power_offset_max': 35,
+    'power_offset_min': 0,
+    
+    # Memory clock offset (MHz) - applied via NVML
+    'memory_offset': 0,  # Set non-zero to overclock memory
+    
+    # Offset change threshold to prevent micro-adjustments
+    'offset_change_threshold': 15,  # Only apply if offset changes by at least this much (MHz)
+    
+    # Performance optimizations
+    'skip_idle_and_low_power_pstates': True,  # Skip offset calculations when GPU is idle or low power
+    'idle_and_low_power_pstates_threshold': 1,  # P-states above this are considered idle/low-power
+   
+    # Control flags
+    'drain_offset_control': True,
+    'power_offset_control': True,
+    'critical_temp_range_control': True,
+    'show_info': True,
+    
+    # Reset clock limits on exit
+    'reset_clock_limits_on_exit': False,  # Keep clock limits after script stops
+    
+    # Refresh interval (seconds)
+    'refresh_interval': 1,
+    
+    # GPU device ID
+    'gpu_id': 0,
+}
+
+def print_help():
+    """Print help information about the script and configuration."""
+    help_text = """
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                     GPU OFFSET CONTROL SCRIPT - HELP                         ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION:
+  This script dynamically adjusts GPU clock offsets based on temperature, power,
+  and frequency using NVIDIA Management Library (NVML).
+
+REQUIREMENTS:
+  - nvidia-ml-py library (pip install nvidia-ml-py)
+  - NVIDIA GPU with offset support
+  - sudo privileges for applying clock limits
+
+USAGE:
+  sudo python3 gpu_offset_control.py [options]
+
+OPTIONS:
+  -h, --help     Show this help message and exit
+  -d, --device   GPU device ID (default: 0)
+
+CONFIGURABLE PARAMETERS:
+  
+  Clock Frequency Limits:
+    min_clock              Minimum GPU clock frequency (MHz)
+    max_clock              Maximum GPU clock frequency (MHz)
+  
+  Temperature Thresholds:
+    temperature_min        Minimum temperature for offset calculations (°C)
+    temperature_max        Maximum temperature for offset calculations (°C)
+    critical_temp_min      Critical temperature range minimum (°C)
+    critical_temp_max      Critical temperature range maximum (°C)
+  
+  Power Limits:
+    plimit_min            Minimum power threshold (watts)
+    plimit_max            Maximum power threshold (watts)
+  
+  Frequency Thresholds:
+    frequency_min         Minimum frequency for offset calculations (MHz)
+    frequency_max         Maximum frequency for offset calculations (MHz)
+  
+  Base Frequency Offset:
+    freq_offset_max       Maximum frequency offset at frequency_min (MHz)
+    freq_offset_min       Minimum frequency offset at frequency_max (MHz)
+    
+    → Linearly interpolates between frequency_min and frequency_max
+    → Used for non-P0 states to prevent crashes
+  
+  Low Frequency Range (drain offset):
+    low_freq_min          Low frequency range start (MHz)
+    low_freq_max          Low frequency range end (MHz)
+    drain_offset_lmin     Drain offset at temperature_min (MHz)
+    drain_offset_lmax     Drain offset at temperature_max (MHz)
+    
+    → Applies when GPU frequency is between low_freq_min and low_freq_max
+    → Linearly increases with temperature
+  
+  High Frequency Range (drain offset):
+    high_freq_min         High frequency range start (MHz)
+    high_freq_max         High frequency range end (MHz)
+    drain_offset_hmin     Drain offset at temperature_max (MHz)
+    drain_offset_hmax     Drain offset at temperature_min (MHz)
+    
+    → Applies when GPU frequency is between high_freq_min and high_freq_max
+    → Linearly decreases with temperature
+  
+  Power-Based Offset:
+    power_offset_max      Maximum power offset at/below plimit_min (MHz)
+    power_offset_min      Minimum power offset at/above plimit_max (MHz)
+    
+    → Linearly interpolates between plimit_min and plimit_max
+  
+  Memory Clock Offset:
+    memory_offset         Memory clock offset in MHz (applied via NVML)
+                          Set to non-zero to overclock memory
+                          Will be reset on exit if reset_clock_limits_on_exit is True
+  
+  P-State Configuration:
+    offset_change_threshold       Minimum offset change to trigger update (MHz)
+                                  Prevents micro-adjustments that cause stuttering
+    skip_idle_and_low_power_pstates  Skip calculations when GPU is idle/low-power
+    idle_and_low_power_pstates_threshold  P-states above this are idle/low-power
+  
+  Control Flags:
+    drain_offset_control          Enable/disable drain offset (True/False)
+    power_offset_control          Enable/disable power offset (True/False)
+    critical_temp_range_control   Enable/disable critical temp logic (True/False)
+    show_info                     Show detailed statistics (True/False)
+    reset_clock_limits_on_exit    Reset clock limits when stopping (True/False)
+  
+  Refresh Settings:
+    refresh_interval      Update interval in seconds
+
+OFFSET CALCULATION:
+  
+  1. Base Frequency Offset (freq_offset):
+     - Linearly decreases from freq_offset_max to freq_offset_min
+     - Based on current GPU frequency between frequency_min and frequency_max
+  
+  2. Drain Offset (drain_offset):
+     - Applies different offsets for low and high frequency ranges
+     - Low range: Changes with temperature increase
+     - High range: Changes with temperature increase
+     - Critical temp range overrides if enabled
+  
+  3. Power Offset (power_offset):
+     - Maximum offset at low power consumption
+     - Minimum offset at high power consumption
+     - Linear transition between thresholds
+  
+  4. Total Offset:
+     - P-state 0: Combines all enabled offsets using smart rounding
+     - Other P-states: Uses freq_offset_min to prevent crashes
+     - Applied to GPU using NVML
+
+SMART ROUNDING:
+  - Offsets are rounded based on offset_change_threshold
+  - Only increases to next threshold if offset is >= 2/3 of the way
+  - Example with threshold=15:
+    * 120.0 → 120 (8 × 15)
+    * 129.9 → 120 (not enough to round up)
+    * 130.0 → 135 (rounds up to 9 × 15)
+
+EXAMPLES:
+  
+  # Run with default configuration
+  sudo python3 gpu_offset_control.py
+  
+  # Run on GPU device 1
+  sudo python3 gpu_offset_control.py -d 1
+  
+  # View help without applying settings
+  python3 gpu_offset_control.py -h
+
+NOTES:
+  - Only P-state 0 receives calculated offsets
+  - Non-P0 states use freq_offset_min to prevent crashes during level loading
+  - Script requires sudo for setting clock limits
+  - Press Ctrl+C to stop the script gracefully
+
+╚══════════════════════════════════════════════════════════════════════════════╝
+"""
+    print(help_text)
+
+# ===== NVML STRUCTURES =====
+class c_nvmlClockOffset_t(ctypes.Structure):
+    """Structure for clock offset as per NVML API."""
+    _fields_ = [
+        ("version", ctypes.c_uint),
+        ("type", ctypes.c_uint),
+        ("pstate", ctypes.c_uint),
+        ("clockOffsetMHz", ctypes.c_int),
+    ]
+
+# ===== HELPER FUNCTIONS =====
+def linear_interpolate(x, x_min, x_max, y_min, y_max):
+    """Linear interpolation between two points."""
+    if x_max == x_min:
+        return y_min
+    ratio = (x - x_min) / (x_max - x_min)
+    ratio = max(0.0, min(1.0, ratio))  # Clamp between 0 and 1
+    return y_min + ratio * (y_max - y_min)
+
+def smart_round_offset(offset, threshold):
+    """
+    Round offset intelligently based on threshold.
+    Only increases to next threshold multiple if offset is >= 2/3 of the way there.
+    
+    Example with threshold=15:
+    - 120.0 -> 120 (8 * 15)
+    - 129.9 -> 120 (8.66 * 15, but 0.66 < 2/3)
+    - 130.0 -> 135 (8.67 * 15, and 0.67 >= 2/3)
+    """
+    if threshold <= 0:
+        return round(offset)
+    
+    # How many complete threshold units
+    base_units = int(offset / threshold)
+    
+    # Fractional part
+    remainder = offset - (base_units * threshold)
+    
+    # If remainder is >= 2/3 of threshold, round up to next threshold
+    if remainder >= (threshold * 2.0 / 3.0):
+        return (base_units + 1) * threshold
+    else:
+        return base_units * threshold
+
+def calculate_freq_offset(freq, config):
+    """Calculate base frequency offset."""
+    return linear_interpolate(
+        freq,
+        config['frequency_min'],
+        config['frequency_max'],
+        config['freq_offset_max'],
+        config['freq_offset_min']
+    )
+
+def calculate_drain_offset(freq, temp, config):
+    """Calculate drain offset based on frequency range and temperature."""
+    if not config['drain_offset_control']:
+        return 0.0
+    
+    drain = 0.0
+    
+    # Critical temperature range override
+    if config['critical_temp_range_control']:
+        if config['critical_temp_min'] <= temp <= config['critical_temp_max']:
+            if config['low_freq_min'] <= freq <= config['low_freq_max']:
+                return config['drain_offset_lmin']
+            elif config['high_freq_min'] <= freq <= config['high_freq_max']:
+                return config['drain_offset_hmin']
+    
+    # Low frequency range
+    if config['low_freq_min'] <= freq <= config['low_freq_max']:
+        if temp >= config['temperature_max']:
+            drain = config['drain_offset_lmax']
+        else:
+            drain = linear_interpolate(
+                temp,
+                config['temperature_min'],
+                config['temperature_max'],
+                config['drain_offset_lmin'],
+                config['drain_offset_lmax']
+            )
+    
+    # High frequency range
+    elif config['high_freq_min'] <= freq <= config['high_freq_max']:
+        if temp >= config['temperature_max']:
+            drain = config['drain_offset_hmin']
+        else:
+            drain = linear_interpolate(
+                temp,
+                config['temperature_min'],
+                config['temperature_max'],
+                config['drain_offset_hmax'],
+                config['drain_offset_hmin']
+            )
+    
+    return drain
+
+def calculate_power_offset(power, config):
+    """Calculate power-based offset."""
+    if not config['power_offset_control']:
+        return 0.0
+    
+    if power <= config['plimit_min']:
+        return config['power_offset_max']
+    elif power >= config['plimit_max']:
+        return config['power_offset_min']
+    else:
+        return linear_interpolate(
+            power,
+            config['plimit_min'],
+            config['plimit_max'],
+            config['power_offset_max'],
+            config['power_offset_min']
+        )
+
+def get_gpu_stats(handle):
+    """Retrieve current GPU statistics."""
+    try:
+        temp = nvmlDeviceGetTemperature(handle, NVML_TEMPERATURE_GPU)
+        power = nvmlDeviceGetPowerUsage(handle) / 1000.0  # Convert to watts
+        clock = nvmlDeviceGetClockInfo(handle, NVML_CLOCK_GRAPHICS)
+        
+        # Get current P-state
+        try:
+            pstate = nvmlDeviceGetPerformanceState(handle)
+        except:
+            pstate = 0  # Assume P0 if unable to get P-state
+        
+        # Get voltage if available
+        voltage_available = False
+        try:
+            voltage = nvmlDeviceGetClocksThrottleReasons(handle)
+            voltage_available = True
+        except:
+            voltage_available = False
+        
+        return {
+            'temperature': temp,
+            'power': power,
+            'frequency': clock,
+            'pstate': pstate,
+            'voltage_available': voltage_available
+        }
+    except NVMLError as e:
+        print(f"Error getting GPU stats: {e}")
+        return None
+
+def apply_clock_limits(handle, config):
+    """Apply GPU clock frequency limits (requires sudo)."""
+    try:
+        nvmlDeviceSetGpuLockedClocks(
+            handle,
+            config['min_clock'],
+            config['max_clock']
+        )
+        print(f"✓ Clock limits set: {config['min_clock']}-{config['max_clock']} MHz")
+        return True
+    except NVMLError as e:
+        print(f"✗ Error setting clock limits: {e}")
+        print("  Note: This operation requires sudo privileges")
+        return False
+
+def set_pstate_clock_offset(handle, clock_type, clock_offset, pstate):
+    """Set clock offset for a specific P-state."""
+    try:
+        struct = c_nvmlClockOffset_t()
+        struct.version = nvmlClockOffset_v1
+        struct.type = clock_type
+        struct.pstate = pstate
+        struct.clockOffsetMHz = clock_offset
+        nvmlDeviceSetClockOffsets(handle, ctypes.byref(struct))
+    except NVMLError:
+        pass  # Silently ignore errors
+
+def apply_clock_offset(handle, offset, pstate=0):
+    """Apply GPU clock offset using NVML."""
+    try:
+        offset_value = int(offset)
+        # Apply offset to specified P-state
+        # NVML_CLOCK_GRAPHICS = 0 for graphics clock
+        set_pstate_clock_offset(handle, 0, offset_value, pstate)
+        return True
+    except Exception:
+        return False
+
+def apply_memory_offset(handle, offset, pstate=0):
+    """Apply memory clock offset using NVML."""
+    try:
+        offset_value = int(offset)
+        # Apply memory offset to specified P-state
+        # NVML_CLOCK_MEM = 2 for memory clock
+        set_pstate_clock_offset(handle, 2, offset_value, pstate)
+        return True
+    except Exception:
+        return False
+
+def display_stats(stats, offsets, total_offset_raw, total_offset, config, status="ACTIVE"):
+    """Display current GPU statistics and offset information."""
+    if not config['show_info']:
+        return
+    
+    print("\n" + "="*80)
+    print(f"GPU Statistics: [{status}] - {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print("="*80)
+    print(f"  P-State:       P{stats['pstate']}")
+    print(f"  Frequency:     {stats['frequency']:>6} MHz")
+    print(f"  Temperature:   {stats['temperature']:>6}°C")
+    print(f"  Power:         {stats['power']:>6.1f} W")
+    
+    if stats['voltage_available']:
+        print(f"  Voltage Info:  Available")
+    
+    if stats['pstate'] == 0:
+        print(f"\nOffset Breakdown:")
+        print(f"  Freq Offset:   {offsets['freq']:>6.1f} MHz")
+        
+        if config['drain_offset_control']:
+            print(f"  Drain Offset:  {offsets['drain']:>6.1f} MHz")
+        else:
+            print(f"  Drain Offset:  DISABLED")
+        
+        if config['power_offset_control']:
+            print(f"  Power Offset:  {offsets['power']:>6.1f} MHz")
+        else:
+            print(f"  Power Offset:  DISABLED")
+        
+        print(f"\n  Raw Total:     {total_offset_raw:>6.1f} MHz")
+        print(f"  Applied:       {total_offset:>6} MHz")
+    else:
+        print(f"\nOffset: Using freq_offset_min ({config['freq_offset_min']} MHz) for non-P0 state")
+    
+    print("="*80)
+
+def main():
+    """Main control loop."""
+    parser = argparse.ArgumentParser(
+        description='GPU Offset Control using NVML',
+        add_help=False
+    )
+    parser.add_argument('-h', '--help', action='store_true', help='Show help message')
+    parser.add_argument('-d', '--device', type=int, default=CONFIG['gpu_id'], help='GPU device ID')
+    
+    args = parser.parse_args()
+    
+    if args.help:
+        print_help()
+        return
+    
+    # Initialize NVML
+    try:
+        nvmlInit()
+    except NVMLError as e:
+        print(f"Failed to initialize NVML: {e}")
+        sys.exit(1)
+    
+    try:
+        # Get GPU handle
+        handle = nvmlDeviceGetHandleByIndex(args.device)
+        gpu_name = nvmlDeviceGetName(handle)
+        print(f"\n🎮 GPU Device: {gpu_name} (ID: {args.device})")
+        
+        # Apply clock limits once
+        print("\n📊 Applying initial settings...")
+        if not apply_clock_limits(handle, CONFIG):
+            print("⚠️  Warning: Failed to set clock limits. Continuing anyway...")
+        
+        # Apply memory offset if configured
+        if CONFIG['memory_offset'] != 0:
+            if apply_memory_offset(handle, CONFIG['memory_offset'], 0):
+                print(f"✓ Memory offset applied: {CONFIG['memory_offset']} MHz")
+            else:
+                print(f"✗ Failed to apply memory offset: {CONFIG['memory_offset']} MHz")
+        
+        print(f"\n🔄 Starting offset control loop (refresh: {CONFIG['refresh_interval']}s)")
+        print("Press Ctrl+C to stop\n")
+        
+        # Track last applied offset
+        last_applied_offset = None
+        
+        # Performance tracking
+        idle_count = 0
+        
+        # Main control loop
+        while True:
+            loop_start = time.time()
+            
+            # Get current GPU stats
+            stats = get_gpu_stats(handle)
+            if not stats:
+                time.sleep(CONFIG['refresh_interval'])
+                continue
+            
+            # Check if GPU is in idle/low-power P-state
+            is_idle_or_low_power = CONFIG['skip_idle_and_low_power_pstates'] and \
+                                   stats['pstate'] > CONFIG['idle_and_low_power_pstates_threshold']
+            
+            if is_idle_or_low_power:
+                idle_count += 1
+                # Display status periodically when idle
+                if CONFIG['show_info'] and idle_count % 5 == 0:
+                    print(f"\n{'='*80}")
+                    print(f"GPU Status: [IDLE/LOW-POWER - P{stats['pstate']}]")
+                    print(f"  Frequency:     {stats['frequency']:>6} MHz")
+                    print(f"  Temperature:   {stats['temperature']:>6}°C")
+                    print(f"  Power:         {stats['power']:>6.1f} W")
+                    print(f"  Idle cycles:   {idle_count}")
+                    print(f"{'='*80}")
+                
+                time.sleep(CONFIG['refresh_interval'])
+                continue
+            
+            # Reset idle counter when active
+            if idle_count > 0 and CONFIG['show_info']:
+                print(f"\n⚡ GPU became active after {idle_count} idle cycles")
+                idle_count = 0
+            
+            # Determine which offset to apply based on P-state
+            if stats['pstate'] == 0:
+                # P0 state - calculate full offset
+                freq_offset = calculate_freq_offset(stats['frequency'], CONFIG)
+                drain_offset = calculate_drain_offset(stats['frequency'], stats['temperature'], CONFIG)
+                power_offset = calculate_power_offset(stats['power'], CONFIG)
+                
+                # Calculate total offset
+                total_offset_raw = freq_offset
+                if CONFIG['drain_offset_control']:
+                    total_offset_raw += drain_offset
+                if CONFIG['power_offset_control']:
+                    total_offset_raw += power_offset
+                
+                # Apply smart rounding for P0 state
+                total_offset = smart_round_offset(total_offset_raw, CONFIG['offset_change_threshold'])
+            else:
+                # Non-P0 state - use freq_offset_min rounded to valid GPU firmware step
+                freq_offset = CONFIG['freq_offset_min']
+                drain_offset = 0
+                power_offset = 0
+                total_offset_raw = CONFIG['freq_offset_min']
+                # Round freq_offset_min to nearest valid step (divisible by offset_change_threshold)
+                total_offset = round(CONFIG['freq_offset_min'] / CONFIG['offset_change_threshold']) * CONFIG['offset_change_threshold']
+            
+            # Only apply offset if it has changed
+            should_apply = (last_applied_offset is None) or (total_offset != last_applied_offset)
+            
+            if should_apply:
+                if apply_clock_offset(handle, total_offset, 0):
+                    last_applied_offset = total_offset
+            
+            # Display statistics
+            display_stats(stats, {
+                'freq': freq_offset,
+                'drain': drain_offset,
+                'power': power_offset
+            }, total_offset_raw, total_offset, CONFIG, "ACTIVE")
+            
+            # Calculate sleep time to maintain consistent refresh rate
+            loop_duration = time.time() - loop_start
+            sleep_time = max(0, CONFIG['refresh_interval'] - loop_duration)
+            time.sleep(sleep_time)
+    
+    except KeyboardInterrupt:
+        print("\n\n⏹️  Stopping GPU offset control...")
+    except Exception as e:
+        print(f"\n❌ Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Cleanup
+        try:
+            if CONFIG['reset_clock_limits_on_exit']:
+                # Reset everything to default
+                nvmlDeviceResetGpuLockedClocks(handle)
+                print("✓ Clock limits reset")
+                
+                # Reset graphics clock offset to 0
+                apply_clock_offset(handle, 0, 0)
+                print("✓ Graphics clock offset reset to 0")
+                
+                # Reset memory offset to 0 if it was applied
+                if CONFIG['memory_offset'] != 0:
+                    apply_memory_offset(handle, 0, 0)
+                    print("✓ Memory clock offset reset to 0")
+            else:
+                # Keep clock limits but apply stable freq_offset_min
+                # Round to valid firmware step
+                stable_offset = round(CONFIG['freq_offset_min'] / CONFIG['offset_change_threshold']) * CONFIG['offset_change_threshold']
+                apply_clock_offset(handle, stable_offset, 0)
+                print(f"✓ Keeping clock limits with stable offset: {stable_offset} MHz")
+                print("✓ Memory offset kept as configured")
+        except Exception as e:
+            print(f"⚠️  Cleanup warning: {e}")
+        
+        nvmlShutdown()
+        print("✓ NVML shutdown complete\n")
+
+if __name__ == "__main__":
+    main()

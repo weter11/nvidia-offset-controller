@@ -1,7 +1,11 @@
 # nvidia-offset-controller
 Small scripts to control Nvidia GPUs frequency offsets
 
-Second edition now uses python and working only on drivers 555+
+Second edition now uses python.
+Requirements: 
+Driver 555+
+Python 3.12
+nvidia-smi <=565 (only for voltage reading)
 
 Basic offset controller with advanced settings.
 

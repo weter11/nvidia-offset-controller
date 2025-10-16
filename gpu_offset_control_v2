@@ -9,12 +9,14 @@ import time
 import argparse
 from pynvml import *
 import ctypes
+import subprocess
+import re
 
 # ===== USER CONFIGURABLE PARAMETERS =====
 CONFIG = {
     # Clock frequency limits (MHz)
     'min_clock': 210,
-    'max_clock': 1800,
+    'max_clock': 1740,
     
     # Temperature thresholds (°C)
     'temperature_min': 20,
@@ -34,12 +36,12 @@ CONFIG = {
     
     # Low frequency range settings
     'low_freq_min': 1000,
-    'low_freq_max': 1450,
+    'low_freq_max': 1440,
     'drain_offset_lmin': -30,
     'drain_offset_lmax': 0,
     
     # High frequency range settings
-    'high_freq_min': 1450,
+    'high_freq_min': 1440,
     'high_freq_max': 1800,
     'drain_offset_hmin': 0,
     'drain_offset_hmax': 15,
@@ -53,7 +55,7 @@ CONFIG = {
     'power_offset_min': 0,
     
     # Memory clock offset (MHz) - applied via NVML
-    'memory_offset': 0,  # Set non-zero to overclock memory
+    'memory_offset': 0,  # Set non-zero to overclock/underclock memory
     
     # Offset change threshold to prevent micro-adjustments
     'offset_change_threshold': 15,  # Only apply if offset changes by at least this much (MHz)
@@ -61,6 +63,7 @@ CONFIG = {
     # Performance optimizations
     'skip_idle_and_low_power_pstates': True,  # Skip offset calculations when GPU is idle or low power
     'idle_and_low_power_pstates_threshold': 1,  # P-states above this are considered idle/low-power
+    'idle_status_display_interval': 10,  # Show idle status every N cycles
    
     # Control flags
     'drain_offset_control': True,
@@ -70,6 +73,9 @@ CONFIG = {
     
     # Reset clock limits on exit
     'reset_clock_limits_on_exit': False,  # Keep clock limits after script stops
+    
+    # Voltage monitoring legacy path (for nvidia-smi 565 or earlier)
+    'nvidia_smi_legacy_path': '',  # Example: '/path/to/nvidia-smi-565'
     
     # Refresh interval (seconds)
     'refresh_interval': 1,
@@ -90,8 +96,8 @@ DESCRIPTION:
   and frequency using NVIDIA Management Library (NVML).
 
 REQUIREMENTS:
+  - NVIDIA GPU
   - nvidia-ml-py library (pip install nvidia-ml-py)
-  - NVIDIA GPU with offset support
   - sudo privileges for applying clock limits
 
 USAGE:
@@ -136,6 +142,7 @@ CONFIGURABLE PARAMETERS:
     
     → Applies when GPU frequency is between low_freq_min and low_freq_max
     → Linearly increases with temperature
+    → GPU voltage should be below 700mV
   
   High Frequency Range (drain offset):
     high_freq_min         High frequency range start (MHz)
@@ -145,6 +152,7 @@ CONFIGURABLE PARAMETERS:
     
     → Applies when GPU frequency is between high_freq_min and high_freq_max
     → Linearly decreases with temperature
+    → GPU voltage should be above 700mV
   
   Power-Based Offset:
     power_offset_max      Maximum power offset at/below plimit_min (MHz)
@@ -162,13 +170,20 @@ CONFIGURABLE PARAMETERS:
                                   Prevents micro-adjustments that cause stuttering
     skip_idle_and_low_power_pstates  Skip calculations when GPU is idle/low-power
     idle_and_low_power_pstates_threshold  P-states above this are idle/low-power
+    idle_status_display_interval  Show idle status every N cycles
   
   Control Flags:
     drain_offset_control          Enable/disable drain offset (True/False)
     power_offset_control          Enable/disable power offset (True/False)
-    critical_temp_range_control   Enable/disable critical temp logic (True/False)
+    critical_temp_range_control   Enable/disable critical temp logic
+                                  (disable drain offset in temps where voltage fluctuates) (True/False)
     show_info                     Show detailed statistics (True/False)
     reset_clock_limits_on_exit    Reset clock limits when stopping (True/False)
+  
+  Voltage Monitoring (nvidia-smi 565 or earlier):
+    nvidia_smi_legacy_path        Path to nvidia-smi binary v565 or earlier
+                                  Example: '/opt/nvidia-565/bin/nvidia-smi'
+                                  Leave empty to use system nvidia-smi
   
   Refresh Settings:
     refresh_interval      Update interval in seconds
@@ -183,7 +198,7 @@ OFFSET CALCULATION:
      - Applies different offsets for low and high frequency ranges
      - Low range: Changes with temperature increase
      - High range: Changes with temperature increase
-     - Critical temp range overrides if enabled
+     - Critical temp range overrides if enabled to prevent crashes
   
   3. Power Offset (power_offset):
      - Maximum offset at low power consumption
@@ -216,9 +231,11 @@ EXAMPLES:
 
 NOTES:
   - Only P-state 0 receives calculated offsets
-  - Non-P0 states use freq_offset_min to prevent crashes during level loading
+  - Non-P0 states use freq_offset_min to prevent crashes during periods when GPU 
+    is underpowered (in menus, FMV, game emulators, etc.)
   - Script requires sudo for setting clock limits
   - Press Ctrl+C to stop the script gracefully
+  - Voltage monitoring requires nvidia-smi version 565 or earlier
 
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
@@ -267,6 +284,88 @@ def smart_round_offset(offset, threshold):
         return (base_units + 1) * threshold
     else:
         return base_units * threshold
+
+def get_pynvml_version():
+    """Get NVML version from the library."""
+    try:
+        version = nvmlSystemGetNVMLVersion()
+        return version
+    except:
+        return "unknown"
+
+def get_nvidia_smi_version():
+    """Get system nvidia-smi driver version."""
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=driver_version', '--format=csv,noheader'],
+            capture_output=True,
+            text=True,
+            timeout=2
+        )
+        if result.returncode == 0:
+            # Parse version like "580.15.03" -> 580
+            version_str = result.stdout.strip()
+            match = re.match(r'(\d+)', version_str)
+            if match:
+                return int(match.group(1))
+    except:
+        pass
+    return 0
+
+def get_driver_version():
+    """Get NVIDIA driver version."""
+    try:
+        version = nvmlSystemGetDriverVersion()
+        # Extract major version number (e.g., "565.57.01" -> 565)
+        match = re.match(r'(\d+)', version)
+        if match:
+            return int(match.group(1))
+        return 0
+    except:
+        return 0
+
+def get_voltage_nvidia_smi(gpu_id, nvidia_smi_path='nvidia-smi'):
+    """Get GPU voltage using nvidia-smi -q -d VOLTAGE."""
+    try:
+        result = subprocess.run(
+            [nvidia_smi_path, '-q', '-d', 'VOLTAGE', '-i', str(gpu_id)],
+            capture_output=True,
+            text=True,
+            timeout=2
+        )
+        if result.returncode == 0:
+            match = re.search(r'Graphics\s+:\s+([0-9.]+)\s*mV', result.stdout)
+            if match:
+                voltage_mv = float(match.group(1))
+                return voltage_mv / 1000.0  # Convert to V
+    except Exception:
+        pass
+    return None
+
+def get_gpu_voltage(gpu_id, config, nvidia_smi_version):
+    """
+    Get GPU voltage using nvidia-smi (version 565 or earlier).
+    
+    Priority:
+    1. System nvidia-smi (if version 565 or earlier)
+    2. User-specified legacy nvidia-smi binary
+    
+    Returns: (voltage_value, voltage_method) or (None, None) if unavailable
+    """
+    
+    # Priority 1: System nvidia-smi version 565 or earlier
+    if nvidia_smi_version > 0 and nvidia_smi_version <= 565:
+        voltage = get_voltage_nvidia_smi(gpu_id)
+        if voltage is not None:
+            return voltage, f"nvidia-smi {nvidia_smi_version}"
+    
+    # Priority 2: User-specified legacy nvidia-smi binary
+    if config.get('nvidia_smi_legacy_path', ''):
+        voltage = get_voltage_nvidia_smi(gpu_id, config['nvidia_smi_legacy_path'])
+        if voltage is not None:
+            return voltage, f"legacy nvidia-smi"
+    
+    return None, None
 
 def calculate_freq_offset(freq, config):
     """Calculate base frequency offset."""
@@ -339,7 +438,7 @@ def calculate_power_offset(power, config):
             config['power_offset_min']
         )
 
-def get_gpu_stats(handle):
+def get_gpu_stats(handle, gpu_id, config, nvidia_smi_version):
     """Retrieve current GPU statistics."""
     try:
         temp = nvmlDeviceGetTemperature(handle, NVML_TEMPERATURE_GPU)
@@ -352,23 +451,19 @@ def get_gpu_stats(handle):
         except:
             pstate = 0  # Assume P0 if unable to get P-state
         
-        # Get voltage if available
-        voltage_available = False
-        try:
-            voltage = nvmlDeviceGetClocksThrottleReasons(handle)
-            voltage_available = True
-        except:
-            voltage_available = False
+        # Try to get voltage
+        voltage_value, voltage_method = get_gpu_voltage(gpu_id, config, nvidia_smi_version)
         
         return {
             'temperature': temp,
             'power': power,
             'frequency': clock,
             'pstate': pstate,
-            'voltage_available': voltage_available
+            'voltage_value': voltage_value,
+            'voltage_method': voltage_method
         }
     except NVMLError as e:
-        print(f"Error getting GPU stats: {e}")
+        print(f"Error getting GPU stats: {e}", file=sys.stderr)
         return None
 
 def apply_clock_limits(handle, config):
@@ -433,8 +528,9 @@ def display_stats(stats, offsets, total_offset_raw, total_offset, config, status
     print(f"  Temperature:   {stats['temperature']:>6}°C")
     print(f"  Power:         {stats['power']:>6.1f} W")
     
-    if stats['voltage_available']:
-        print(f"  Voltage Info:  Available")
+    # Show voltage if available
+    if stats['voltage_value'] is not None:
+        print(f"  Voltage:       {stats['voltage_value']:>6.3f} V")
     
     if stats['pstate'] == 0:
         print(f"\nOffset Breakdown:")
@@ -483,7 +579,38 @@ def main():
         # Get GPU handle
         handle = nvmlDeviceGetHandleByIndex(args.device)
         gpu_name = nvmlDeviceGetName(handle)
+        driver_version = get_driver_version()
+        pynvml_version = get_pynvml_version()
+        nvidia_smi_version = get_nvidia_smi_version()
+        
         print(f"\n🎮 GPU Device: {gpu_name} (ID: {args.device})")
+        print(f"📦 Driver Version: {driver_version}")
+        print(f"📦 NVML Version: {pynvml_version}")
+        print(f"📦 nvidia-smi Driver: {nvidia_smi_version}")
+        
+        # Check voltage monitoring capability
+        if nvidia_smi_version > 0 and nvidia_smi_version <= 565:
+            print("✓ Voltage monitoring: Available (system nvidia-smi)")
+        elif CONFIG.get('nvidia_smi_legacy_path', ''):
+            print(f"⚠️  Voltage monitoring: Using legacy nvidia-smi")
+            print(f"  → Path: {CONFIG['nvidia_smi_legacy_path']}")
+            # Test legacy binary
+            try:
+                test_result = subprocess.run(
+                    [CONFIG['nvidia_smi_legacy_path'], '--version'],
+                    capture_output=True,
+                    text=True,
+                    timeout=2
+                )
+                if test_result.returncode == 0:
+                    print(f"  → Test: OK")
+                else:
+                    print(f"  → Test: FAILED (return code {test_result.returncode})")
+            except Exception as e:
+                print(f"  → Test: ERROR - {e}")
+        else:
+            print("⚠️  Voltage monitoring: Not available (nvidia-smi > 565)")
+            print("  → Configure 'nvidia_smi_legacy_path' if needed")
         
         # Apply clock limits once
         print("\n📊 Applying initial settings...")
@@ -511,7 +638,7 @@ def main():
             loop_start = time.time()
             
             # Get current GPU stats
-            stats = get_gpu_stats(handle)
+            stats = get_gpu_stats(handle, args.device, CONFIG, nvidia_smi_version)
             if not stats:
                 time.sleep(CONFIG['refresh_interval'])
                 continue
@@ -523,7 +650,7 @@ def main():
             if is_idle_or_low_power:
                 idle_count += 1
                 # Display status periodically when idle
-                if CONFIG['show_info'] and idle_count % 5 == 0:
+                if CONFIG['show_info'] and idle_count % CONFIG['idle_status_display_interval'] == 0:
                     print(f"\n{'='*80}")
                     print(f"GPU Status: [IDLE/LOW-POWER - P{stats['pstate']}]")
                     print(f"  Frequency:     {stats['frequency']:>6} MHz")
